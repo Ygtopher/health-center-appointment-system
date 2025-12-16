@@ -14,22 +14,48 @@ class USSDController {
         serviceCode,
       } = req.body;
 
-      // Determine language from phone number or default
-      const language = req.body.language || 'en';
+      // Get or create session first
+      const session = ussdHandler.getSession(sessionId, phoneNumber);
+
+      // Use session language (which persists across requests)
+      const language = session.language || 'en';
+
+      // Log incoming request for debugging
+      logger.info('USSD Request:', { sessionId, phoneNumber, text, serviceCode, language: session.language });
 
       // If no text, show main menu
       if (!text || text.trim() === '') {
-        const session = ussdHandler.getSession(sessionId, phoneNumber);
         const response = ussdHandler.formatResponse(
           ussdHandler.getMenuText('main', language),
           false
         );
+        logger.info('Showing main menu:', response.response);
         return res.status(200).send(response.response);
       }
 
-      // Process input
-      const session = ussdHandler.getSession(sessionId, phoneNumber);
-      let response = await ussdHandler.processInput(sessionId, phoneNumber, text, language);
+      // Process input - extract just the user input (remove service code if present)
+      // Africa's Talking may send text like "*384*22787*1#" or just "1"
+      let userInput = text.trim();
+      // If text contains asterisks, extract the last part after the last asterisk
+      if (userInput.includes('*')) {
+        const parts = userInput.split('*');
+        userInput = parts[parts.length - 1].replace('#', '').trim();
+      }
+      // Remove any remaining # characters
+      userInput = userInput.replace(/#/g, '').trim();
+
+      logger.info('Processing input:', { userInput, currentStep: session.step, language: session.language });
+      let response = await ussdHandler.processInput(sessionId, phoneNumber, userInput, language);
+
+      // Ensure response is properly formatted
+      if (!response || !response.response) {
+        logger.error('Invalid response from processInput:', response);
+        return res.status(200).send(
+          language === 'rw'
+            ? 'Ikibazo cyahagaragaye. Ongera ugerageze.'
+            : 'An error occurred. Please try again.'
+        );
+      }
 
       // Handle specific steps that need database interaction
       if (session.step === 'select_health_center' && !session.data.healthCenters) {
@@ -100,6 +126,27 @@ class USSDController {
         }
       }
 
+      if (session.step === 'cancellation_confirmed' && session.data.selectedAppointment) {
+        // Cancel the selected appointment
+        const cancelResult = await this.cancelAppointment(session.data.selectedAppointment.id);
+        if (cancelResult.success) {
+          response = ussdHandler.formatResponse(
+            language === 'rw'
+              ? 'Randevu yakuweho neza.'
+              : 'Appointment cancelled successfully.',
+            true
+          );
+        } else {
+          response = ussdHandler.formatResponse(
+            language === 'rw'
+              ? `Ntibyashoboye gukuraho randevu: ${cancelResult.error}`
+              : `Could not cancel appointment: ${cancelResult.error}`,
+            true
+          );
+        }
+        ussdHandler.clearSession(sessionId);
+      }
+
       if (session.step === 'show_status' && session.data.nationalId) {
         // Show appointment status
         const appointments = await this.getPatientAppointments(session.data.nationalId);
@@ -117,6 +164,7 @@ class USSDController {
         ussdHandler.clearSession(sessionId);
       }
 
+      logger.info('Sending USSD response:', { step: session.step, response: response.response });
       res.status(200).send(response.response);
     } catch (error) {
       logger.error('USSD handler error:', error);
@@ -164,7 +212,7 @@ class USSDController {
 
       while (currentHour < closeHour || (currentHour === closeHour && currentMin < closeMin)) {
         const timeStr = `${String(currentHour).padStart(2, '0')}:${String(currentMin).padStart(2, '0')}`;
-        
+
         // Check if slot is available
         const existingAppt = await query(
           `SELECT COUNT(*) as count FROM appointments 
@@ -196,7 +244,7 @@ class USSDController {
   // Create appointment from USSD session
   async createAppointment(session, phoneNumber) {
     try {
-      const { nationalId, selectedHealthCenter, selectedDate, selectedTime } = session.data;
+      const { nationalId, selectedHealthCenter, selectedDate, selectedTime, appointmentType } = session.data;
 
       // Verify or create patient
       let patientResult = await query(
@@ -206,11 +254,11 @@ class USSDController {
 
       let patientId;
       if (patientResult.rows.length === 0) {
-        // Create patient record
+        // Create basic patient record
         const newPatient = await query(
-          `INSERT INTO patients (national_id, first_name, last_name, phone_number, preferred_language)
-           VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-          [nationalId, 'Patient', 'Unknown', phoneNumber, session.language]
+          `INSERT INTO patients (national_id, phone_number, first_name, last_name) 
+           VALUES ($1, $2, $3, $4) RETURNING id`,
+          [nationalId, phoneNumber, 'USSD', 'User']
         );
         patientId = newPatient.rows[0].id;
       } else {
@@ -222,35 +270,84 @@ class USSDController {
         );
       }
 
-      // Parse date
+      // Convert date format from DD-MM-YYYY to YYYY-MM-DD
       const [day, month, year] = selectedDate.split('-');
-      const appointmentDate = new Date(`${year}-${month}-${day}`);
+      const formattedDate = `${year}-${month}-${day}`;
 
-      // Create appointment
-      const appointmentResult = await query(
+      // Create appointment with appointment type
+      const appointment = await query(
         `INSERT INTO appointments 
-         (patient_id, health_center_id, appointment_date, appointment_time, status, appointment_type)
-         VALUES ($1, $2, $3, $4, 'scheduled', 'general')
+         (patient_id, health_center_id, appointment_date, appointment_time, appointment_type, status, reason) 
+         VALUES ($1, $2, $3, $4, $5, 'scheduled', 'Booked via USSD') 
          RETURNING id`,
-        [patientId, selectedHealthCenter.id, appointmentDate.toISOString().split('T')[0], selectedTime]
+        [patientId, selectedHealthCenter.id, formattedDate, selectedTime, appointmentType || 'general']
       );
 
-      const appointmentId = appointmentResult.rows[0].id;
+      const appointmentId = appointment.rows[0].id;
 
-      // Schedule reminder
-      const reminderTime = moment(appointmentDate).subtract(24, 'hours').toDate();
-      await query(
-        `INSERT INTO reminders (type, reference_id, patient_id, scheduled_time, message, message_kinyarwanda, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
-        [
-          'appointment',
-          appointmentId,
-          patientId,
-          reminderTime,
-          `Reminder: You have an appointment on ${selectedDate} at ${selectedTime}`,
-          `Mwibuke: Mufite randevu kuwa ${selectedDate} saa ${selectedTime}`,
-        ]
+      // Get full appointment details for SMS
+      const fullAppointment = await query(
+        `SELECT a.*, hc.name as health_center_name, hc.name_kinyarwanda as health_center_name_kinyarwanda
+         FROM appointments a
+         JOIN health_centers hc ON a.health_center_id = hc.id
+         WHERE a.id = $1`,
+        [appointmentId]
       );
+
+      const healthCenter = fullAppointment.rows[0];
+
+      // Schedule 24-hour reminder
+      const appointmentDateTime = new Date(`${formattedDate}T${selectedTime}`);
+      const reminderTime24h = new Date(appointmentDateTime.getTime() - 24 * 60 * 60 * 1000);
+
+      if (reminderTime24h > new Date()) {
+        const message = `Reminder: You have an appointment at ${healthCenter.health_center_name} on ${selectedDate} at ${selectedTime}`;
+        const messageRw = `Ibutsa: Ufite randevu kuri ${healthCenter.health_center_name_kinyarwanda || healthCenter.health_center_name} ku wa ${selectedDate} ku isaha ${selectedTime}`;
+
+        await query(
+          `INSERT INTO reminders (type, reference_id, patient_id, scheduled_time, message, message_kinyarwanda, status)
+           VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+          ['appointment', appointmentId, patientId, reminderTime24h, message, messageRw]
+        );
+      }
+
+      // Schedule 2-minute reminder
+      const reminderTime2min = new Date(appointmentDateTime.getTime() - 2 * 60 * 1000);
+
+      if (reminderTime2min > new Date()) {
+        const message = `Your appointment at ${healthCenter.health_center_name} is starting in 2 minutes. Please be ready.`;
+        const messageRw = `Randevu yawe kuri ${healthCenter.health_center_name_kinyarwanda || healthCenter.health_center_name} itangira mu minota 2. Witegure.`;
+
+        await query(
+          `INSERT INTO reminders (type, reference_id, patient_id, scheduled_time, message, message_kinyarwanda, status)
+           VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+          ['appointment', appointmentId, patientId, reminderTime2min, message, messageRw]
+        );
+      }
+
+      // Send confirmation SMS with appointment details
+      if (process.env.SMS_ENABLED === 'true') {
+        const africastalkingService = require('../services/africasTalking');
+        const patientInfo = await query(
+          'SELECT phone_number, preferred_language FROM patients WHERE id = $1',
+          [patientId]
+        );
+
+        if (patientInfo.rows.length > 0) {
+          const patient = patientInfo.rows[0];
+          const appointmentData = {
+            ...fullAppointment.rows[0],
+            health_center_name: fullAppointment.rows[0].health_center_name,
+            health_center_name_kinyarwanda: fullAppointment.rows[0].health_center_name_kinyarwanda,
+          };
+
+          await africastalkingService.sendAppointmentConfirmation(
+            patient,
+            appointmentData,
+            patient.preferred_language || session.language
+          );
+        }
+      }
 
       return { success: true, appointmentId };
     } catch (error) {
@@ -295,12 +392,52 @@ class USSDController {
   formatAppointmentStatus(appointment, language) {
     const date = moment(appointment.appointment_date).format('DD-MM-YYYY');
     const name = language === 'rw' ? appointment.name_kinyarwanda || appointment.name : appointment.name;
-    
+
     if (language === 'rw') {
       return `Randevu:\n${name}\nItariki: ${date}\nIgihe: ${appointment.appointment_time}\nImiterere: ${appointment.status}`;
     }
-    
+
     return `Appointment:\n${name}\nDate: ${date}\nTime: ${appointment.appointment_time}\nStatus: ${appointment.status}`;
+  }
+
+  // Cancel appointment from USSD
+  async cancelAppointment(appointmentId) {
+    try {
+      // Check if appointment exists and is cancellable
+      const appointmentResult = await query(
+        `SELECT id, status FROM appointments 
+         WHERE id = $1 AND status IN ('scheduled', 'confirmed')`,
+        [appointmentId]
+      );
+
+      if (appointmentResult.rows.length === 0) {
+        return { success: false, error: 'Appointment not found or cannot be cancelled' };
+      }
+
+      // Cancel the appointment
+      await query(
+        `UPDATE appointments 
+         SET status = 'cancelled',
+             cancelled_at = CURRENT_TIMESTAMP,
+             cancellation_reason = 'Cancelled via USSD'
+         WHERE id = $1`,
+        [appointmentId]
+      );
+
+      // Cancel related reminders
+      await query(
+        `UPDATE reminders 
+         SET status = 'cancelled'
+         WHERE type = 'appointment' AND reference_id = $1 AND status = 'pending'`,
+        [appointmentId]
+      );
+
+      logger.info(`Appointment cancelled via USSD: ${appointmentId}`);
+      return { success: true };
+    } catch (error) {
+      logger.error('Error cancelling appointment:', error);
+      return { success: false, error: error.message };
+    }
   }
 }
 

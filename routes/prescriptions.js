@@ -24,6 +24,8 @@ router.get('/', prescriptionController.getPrescriptions.bind(prescriptionControl
 router.get('/:id', prescriptionController.getPrescription.bind(prescriptionController));
 router.post('/', prescriptionValidation, prescriptionController.createPrescription.bind(prescriptionController));
 router.put('/:id', prescriptionController.updatePrescription.bind(prescriptionController));
+router.delete('/:id', prescriptionController.deletePrescription.bind(prescriptionController));
+router.patch('/:id/restore', prescriptionController.restorePrescription.bind(prescriptionController));
 
 module.exports = router;
 

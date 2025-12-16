@@ -4,14 +4,19 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const logger = require('./config/logger');
 const reminderScheduler = require('./services/reminderScheduler');
+const { scheduleBackups } = require('./scripts/backupScheduler');
 require('dotenv').config();
 
 // Import routes
 const ussdRoutes = require('./routes/ussd');
+const smsRoutes = require('./routes/sms');
 const authRoutes = require('./routes/auth');
 const appointmentRoutes = require('./routes/appointments');
 const patientRoutes = require('./routes/patients');
 const prescriptionRoutes = require('./routes/prescriptions');
+const consentRoutes = require('./routes/consent');
+const adherenceRoutes = require('./routes/adherence');
+const statsRoutes = require('./routes/stats');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -27,16 +32,20 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Rate limiting
+// Rate limiting - more lenient in development
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
+  max: process.env.NODE_ENV === 'production' ? 100 : 1000, // 1000 in dev, 100 in production
   message: 'Too many requests from this IP, please try again later.',
 });
 app.use('/api/', limiter);
 
 // USSD endpoint (no rate limit, handled by provider)
 app.use('/ussd', ussdRoutes);
+
+// SMS endpoint (no rate limit, handled by provider)
+// Note: Africa's Talking sends SMS as form-urlencoded, so we need to handle it before JSON parser
+app.use('/sms', express.urlencoded({ extended: true }), smsRoutes);
 
 // Health check
 app.get('/health', (req, res) => {
@@ -47,11 +56,40 @@ app.get('/health', (req, res) => {
   });
 });
 
+// SMS endpoint test/debug
+app.get('/sms/test', (req, res) => {
+  res.json({
+    status: 'SMS endpoint is accessible',
+    endpoint: '/sms',
+    method: 'POST',
+    expectedFormat: 'application/x-www-form-urlencoded',
+    fields: ['from', 'to', 'text', 'date', 'id', 'linkId', 'cost', 'networkCode'],
+    callbackUrl: 'https://overrigged-michaele-curtate.ngrok-free.dev/sms',
+  });
+});
+
+// Test SMS endpoint (for debugging)
+app.post('/sms/test', express.urlencoded({ extended: true }), (req, res) => {
+  logger.info('Test SMS endpoint called:', {
+    body: req.body,
+    headers: req.headers,
+    query: req.query,
+  });
+  res.json({
+    success: true,
+    message: 'SMS endpoint is working!',
+    received: req.body,
+  });
+});
+
 // API routes
 app.use('/api/auth', authRoutes);
 app.use('/api/appointments', appointmentRoutes);
 app.use('/api/patients', patientRoutes);
 app.use('/api/prescriptions', prescriptionRoutes);
+app.use('/api/consent', consentRoutes); // Consent routes (includes /api/patients/:id/consent)
+app.use('/api/adherence', adherenceRoutes); // Adherence routes
+app.use('/api/stats', statsRoutes);
 
 // Health centers route (basic implementation)
 app.get('/api/health-centers', async (req, res) => {
@@ -102,6 +140,12 @@ app.listen(PORT, () => {
     logger.info('Reminder scheduler started');
   } else {
     logger.warn('SMS reminders are disabled');
+  }
+
+  // Start backup scheduler
+  if (process.env.BACKUP_ENABLED !== 'false') {
+    scheduleBackups();
+    logger.info('Backup scheduler started');
   }
 });
 

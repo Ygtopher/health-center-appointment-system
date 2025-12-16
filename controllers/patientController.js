@@ -27,6 +27,7 @@ class PatientController {
           cell,
           village,
           preferred_language,
+          cbhi_number,
           created_at
         FROM patients
         WHERE is_active = true
@@ -40,7 +41,8 @@ class PatientController {
           national_id ILIKE $${paramCount} OR
           first_name ILIKE $${paramCount} OR
           last_name ILIKE $${paramCount} OR
-          phone_number ILIKE $${paramCount}
+          phone_number ILIKE $${paramCount} OR
+          cbhi_number ILIKE $${paramCount}
         )`;
         params.push(`%${search}%`);
         paramCount++;
@@ -171,6 +173,7 @@ class PatientController {
         cell,
         village,
         preferredLanguage,
+        cbhiNumber,
       } = req.body;
 
       // Check if patient already exists
@@ -189,8 +192,8 @@ class PatientController {
       const result = await query(
         `INSERT INTO patients 
          (national_id, first_name, last_name, phone_number, date_of_birth, 
-          gender, district, sector, cell, village, preferred_language)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          gender, district, sector, cell, village, preferred_language, cbhi_number)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          RETURNING *`,
         [
           nationalId,
@@ -204,6 +207,7 @@ class PatientController {
           cell,
           village,
           preferredLanguage || 'en',
+          cbhiNumber || null,
         ]
       );
 
@@ -239,6 +243,7 @@ class PatientController {
         'cell',
         'village',
         'preferred_language',
+        'cbhi_number',
       ];
 
       const updateFields = [];

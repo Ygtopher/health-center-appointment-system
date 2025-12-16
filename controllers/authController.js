@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const { query } = require('../config/database');
 const logger = require('../config/logger');
 const { validationResult } = require('express-validator');
+const { validatePassword } = require('../utils/passwordValidator');
 
 class AuthController {
   // Login

@@ -83,7 +83,8 @@ class AppointmentController {
         paramCount++;
       }
 
-      queryText += ` ORDER BY a.appointment_date DESC, a.appointment_time DESC`;
+      // Sort: 1) upcoming (scheduled/confirmed) first, 2) completed, 3) cancelled at bottom
+      queryText += ` ORDER BY CASE WHEN a.status = 'cancelled' THEN 3 WHEN a.status = 'completed' THEN 2 ELSE 1 END, CASE WHEN a.appointment_date >= CURRENT_DATE THEN 0 ELSE 1 END, a.appointment_date ASC, a.appointment_time ASC`;
 
       // Pagination
       const offset = (page - 1) * limit;
@@ -222,20 +223,73 @@ class AppointmentController {
 
       const appointment = result.rows[0];
 
-      // Schedule reminder
-      const reminderTime = moment(appointmentDate).subtract(24, 'hours').toDate();
-      await query(
-        `INSERT INTO reminders (type, reference_id, patient_id, scheduled_time, message, message_kinyarwanda, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
-        [
-          'appointment',
-          appointment.id,
-          patientId,
-          reminderTime,
-          `Reminder: You have an appointment on ${appointmentDate} at ${appointmentTime}`,
-          `Mwibuke: Mufite randevu kuwa ${appointmentDate} saa ${appointmentTime}`,
-        ]
+      // Get health center details for reminder messages
+      const healthCenterResult = await query(
+        `SELECT name, name_kinyarwanda FROM health_centers WHERE id = $1`,
+        [healthCenterId]
       );
+      const healthCenter = healthCenterResult.rows[0];
+
+      // Schedule appointment reminder (24 hours before)
+      const appointmentDateTime = new Date(`${appointmentDate}T${appointmentTime}`);
+      const reminderTime24h = new Date(appointmentDateTime.getTime() - 24 * 60 * 60 * 1000);
+
+      if (reminderTime24h > new Date()) {
+        const message = `Reminder: You have an appointment at ${healthCenter.name} on ${appointmentDate} at ${appointmentTime}`;
+        const messageRw = `Ibutsa: Ufite randevu kuri ${healthCenter.name_kinyarwanda || healthCenter.name} ku wa ${appointmentDate} ku isaha ${appointmentTime}`;
+
+        await query(
+          `INSERT INTO reminders (type, reference_id, patient_id, scheduled_time, message, message_kinyarwanda, status)
+           VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+          ['appointment', appointment.id, patientId, reminderTime24h, message, messageRw]
+        );
+      }
+
+      // Schedule second reminder (2 minutes before appointment)
+      const reminderTime2min = new Date(appointmentDateTime.getTime() - 2 * 60 * 1000);
+
+      if (reminderTime2min > new Date()) {
+        const message = `Your appointment at ${healthCenter.name} is starting in 2 minutes. Please be ready.`;
+        const messageRw = `Randevu yawe kuri ${healthCenter.name_kinyarwanda || healthCenter.name} itangira mu minota 2. Witegure.`;
+
+        await query(
+          `INSERT INTO reminders (type, reference_id, patient_id, scheduled_time, message, message_kinyarwanda, status)
+           VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+          ['appointment', appointment.id, patientId, reminderTime2min, message, messageRw]
+        );
+      }
+      // Send confirmation SMS with appointment details
+      if (process.env.SMS_ENABLED === 'true') {
+        try {
+          const africastalkingService = require('../services/africasTalking');
+
+          // Get full appointment details with health center info
+          const fullAppointment = await query(
+            `SELECT a.*, hc.name as health_center_name, hc.name_kinyarwanda as health_center_name_kinyarwanda
+             FROM appointments a
+             JOIN health_centers hc ON a.health_center_id = hc.id
+             WHERE a.id = $1`,
+            [appointment.id]
+          );
+
+          const patientInfo = await query(
+            'SELECT phone_number, preferred_language FROM patients WHERE id = $1',
+            [patientId]
+          );
+
+          if (patientInfo.rows.length > 0 && patientInfo.rows[0].phone_number && fullAppointment.rows.length > 0) {
+            const patient = patientInfo.rows[0];
+            await africastalkingService.sendAppointmentConfirmation(
+              patient,
+              fullAppointment.rows[0],
+              patient.preferred_language || 'en'
+            );
+          }
+        } catch (smsError) {
+          logger.error('Error sending appointment confirmation SMS:', smsError);
+          // Don't fail the appointment creation if SMS fails
+        }
+      }
 
       res.status(201).json({
         success: true,
@@ -334,10 +388,94 @@ class AppointmentController {
         params
       );
 
+      const updatedAppointment = result.rows[0];
+
+      const smsEnabled = process.env.SMS_ENABLED === 'true';
+
+      // Send SMS when appointment is confirmed
+      if (status === 'confirmed' && smsEnabled) {
+        try {
+          const africastalkingService = require('../services/africasTalking');
+
+          // Get full appointment details with health center info
+          const fullAppointment = await query(
+            `SELECT a.*, hc.name as health_center_name, hc.name_kinyarwanda as health_center_name_kinyarwanda
+             FROM appointments a
+             JOIN health_centers hc ON a.health_center_id = hc.id
+             WHERE a.id = $1`,
+            [id]
+          );
+
+          // Get patient information
+          const patientInfo = await query(
+            'SELECT phone_number, preferred_language FROM patients WHERE id = $1',
+            [updatedAppointment.patient_id]
+          );
+
+          if (patientInfo.rows.length > 0 && patientInfo.rows[0].phone_number && fullAppointment.rows.length > 0) {
+            const patient = patientInfo.rows[0];
+            await africastalkingService.sendAppointmentConfirmation(
+              patient,
+              fullAppointment.rows[0],
+              patient.preferred_language || 'en'
+            );
+
+            logger.info('Confirmation SMS sent to patient', {
+              appointmentId: id,
+              patientId: updatedAppointment.patient_id,
+              phoneNumber: patient.phone_number,
+            });
+          }
+        } catch (smsError) {
+          logger.error('Error sending confirmation SMS:', smsError);
+          // Don't fail the appointment update if SMS fails
+        }
+      }
+
+      // Send SMS when appointment is cancelled
+      if (status === 'cancelled' && smsEnabled) {
+        try {
+          const africastalkingService = require('../services/africasTalking');
+
+          // Get full appointment details with health center info
+          const fullAppointment = await query(
+            `SELECT a.*, hc.name as health_center_name, hc.name_kinyarwanda as health_center_name_kinyarwanda
+             FROM appointments a
+             JOIN health_centers hc ON a.health_center_id = hc.id
+             WHERE a.id = $1`,
+            [id]
+          );
+
+          // Get patient information
+          const patientInfo = await query(
+            'SELECT phone_number, preferred_language FROM patients WHERE id = $1',
+            [updatedAppointment.patient_id]
+          );
+
+          if (patientInfo.rows.length > 0 && patientInfo.rows[0].phone_number && fullAppointment.rows.length > 0) {
+            const patient = patientInfo.rows[0];
+            await africastalkingService.sendAppointmentCancellation(
+              patient,
+              fullAppointment.rows[0],
+              patient.preferred_language || 'en'
+            );
+
+            logger.info('Cancellation SMS sent to patient', {
+              appointmentId: id,
+              patientId: updatedAppointment.patient_id,
+              phoneNumber: patient.phone_number,
+            });
+          }
+        } catch (smsError) {
+          logger.error('Error sending cancellation SMS:', smsError);
+          // Don't fail the appointment update if SMS fails
+        }
+      }
+
       res.json({
         success: true,
         message: 'Appointment updated successfully',
-        data: result.rows[0],
+        data: updatedAppointment,
       });
     } catch (error) {
       logger.error('Error updating appointment:', error);
@@ -379,6 +517,46 @@ class AppointmentController {
          WHERE type = 'appointment' AND reference_id = $1 AND status = 'pending'`,
         [id]
       );
+
+      // Send cancellation SMS
+      if (process.env.SMS_ENABLED === 'true') {
+        try {
+          const africastalkingService = require('../services/africasTalking');
+
+          // Get full appointment details with health center info
+          const fullAppointment = await query(
+            `SELECT a.*, hc.name as health_center_name, hc.name_kinyarwanda as health_center_name_kinyarwanda
+             FROM appointments a
+             JOIN health_centers hc ON a.health_center_id = hc.id
+             WHERE a.id = $1`,
+            [id]
+          );
+
+          // Get patient information
+          const patientInfo = await query(
+            'SELECT phone_number, preferred_language FROM patients WHERE id = $1',
+            [result.rows[0].patient_id]
+          );
+
+          if (patientInfo.rows.length > 0 && patientInfo.rows[0].phone_number && fullAppointment.rows.length > 0) {
+            const patient = patientInfo.rows[0];
+            await africastalkingService.sendAppointmentCancellation(
+              patient,
+              fullAppointment.rows[0],
+              patient.preferred_language || 'en'
+            );
+
+            logger.info('Cancellation SMS sent to patient', {
+              appointmentId: id,
+              patientId: result.rows[0].patient_id,
+              phoneNumber: patient.phone_number,
+            });
+          }
+        } catch (smsError) {
+          logger.error('Error sending cancellation SMS:', smsError);
+          // Don't fail the cancellation if SMS fails
+        }
+      }
 
       res.json({
         success: true,
@@ -442,7 +620,7 @@ class AppointmentController {
 
       while (currentHour < closeHour || (currentHour === closeHour && currentMin < closeMin)) {
         const timeStr = `${String(currentHour).padStart(2, '0')}:${String(currentMin).padStart(2, '0')}`;
-        
+
         // Check availability
         const existing = await query(
           `SELECT COUNT(*) as count FROM appointments

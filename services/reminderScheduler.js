@@ -21,6 +21,11 @@ class ReminderScheduler {
       await this.processReminders();
     });
 
+    // Run every 10 minutes to update appointment statuses
+    cron.schedule('*/10 * * * *', async () => {
+      await this.updateAppointmentStatuses();
+    });
+
     logger.info('Reminder scheduler started');
     this.isRunning = true;
   }
@@ -33,9 +38,16 @@ class ReminderScheduler {
 
       // Get reminders that are due
       const result = await query(
-        `SELECT r.*, p.phone_number, p.preferred_language as patient_preferred_language, p.first_name, p.last_name
+        `SELECT r.*,
+                p.phone_number,
+                p.preferred_language as patient_preferred_language,
+                p.first_name,
+                p.last_name,
+                a.appointment_date,
+                a.appointment_time
          FROM reminders r
          JOIN patients p ON r.patient_id = p.id
+         LEFT JOIN appointments a ON r.type = 'appointment' AND r.reference_id = a.id
          WHERE r.status = 'pending'
          AND r.scheduled_time <= $1
          AND r.scheduled_time >= $2
@@ -47,6 +59,21 @@ class ReminderScheduler {
       logger.info(`Processing ${result.rows.length} reminders`);
 
       for (const reminder of result.rows) {
+        // Guard: if appointment reminder and appointment time has passed, expire it
+        if (reminder.type === 'appointment' && reminder.appointment_date && reminder.appointment_time) {
+          const appointmentMoment = moment(`${reminder.appointment_date} ${reminder.appointment_time}`, 'YYYY-MM-DD HH:mm:ss');
+          if (appointmentMoment.isBefore(moment())) {
+            await query(
+              `UPDATE reminders 
+               SET status = 'expired', error_message = 'Appointment time passed'
+               WHERE id = $1`,
+              [reminder.id]
+            );
+            logger.info('Skipping expired appointment reminder', { reminderId: reminder.id });
+            continue;
+          }
+        }
+
         await this.sendReminder(reminder);
       }
     } catch (error) {
@@ -246,6 +273,30 @@ class ReminderScheduler {
     }
 
     return { times };
+  }
+
+  // Update appointment statuses for past appointments
+  async updateAppointmentStatuses() {
+    try {
+      const now = moment();
+
+      // Update appointments that have passed their scheduled time
+      const result = await query(
+        `UPDATE appointments 
+         SET status = 'completed', 
+             completed_at = CURRENT_TIMESTAMP
+         WHERE status IN ('scheduled', 'confirmed')
+         AND CONCAT(appointment_date::text, ' ', appointment_time)::timestamp < $1
+         RETURNING id, appointment_date, appointment_time`,
+        [now.toDate()]
+      );
+
+      if (result.rows.length > 0) {
+        logger.info(`Updated ${result.rows.length} appointments to completed status`);
+      }
+    } catch (error) {
+      logger.error('Error updating appointment statuses:', error);
+    }
   }
 }
 

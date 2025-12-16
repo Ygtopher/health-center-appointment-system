@@ -16,28 +16,8 @@ function Dashboard() {
 
   const fetchStats = async () => {
     try {
-      const today = new Date().toISOString().split('T')[0];
-      
-      const [appointmentsRes, patientsRes, prescriptionsRes] = await Promise.all([
-        axios.get('/api/appointments', { params: { startDate: today } }),
-        axios.get('/api/patients', { params: { limit: 1 } }),
-        axios.get('/api/prescriptions', { params: { limit: 1 } }),
-      ]);
-
-      const appointments = appointmentsRes.data.data || [];
-      const todayAppointments = appointments.filter(
-        (apt) => apt.appointment_date === today
-      );
-
-      setStats({
-        appointments: {
-          today: todayAppointments.length,
-          upcoming: appointments.length,
-          total: appointmentsRes.data.pagination?.total || 0,
-        },
-        patients: patientsRes.data.pagination?.total || 0,
-        prescriptions: prescriptionsRes.data.pagination?.total || 0,
-      });
+      const response = await axios.get('/api/stats');
+      setStats(response.data.data);
     } catch (error) {
       console.error('Error fetching stats:', error);
     } finally {

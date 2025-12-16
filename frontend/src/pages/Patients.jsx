@@ -6,6 +6,7 @@ function Patients() {
   const [patients, setPatients] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
+  const [selectedPatient, setSelectedPatient] = useState(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [formData, setFormData] = useState({
     nationalId: '',
@@ -35,6 +36,7 @@ function Patients() {
   };
 
   const handleCreate = () => {
+    setSelectedPatient(null);
     setFormData({
       nationalId: '',
       firstName: '',
@@ -48,10 +50,39 @@ function Patients() {
     setShowModal(true);
   };
 
+  const handleEdit = (patient) => {
+    setSelectedPatient(patient);
+
+    // Format date to YYYY-MM-DD for date input
+    let formattedDate = '';
+    if (patient.date_of_birth) {
+      const date = new Date(patient.date_of_birth);
+      formattedDate = date.toISOString().split('T')[0];
+    }
+
+    setFormData({
+      nationalId: patient.national_id,
+      firstName: patient.first_name,
+      lastName: patient.last_name,
+      phoneNumber: patient.phone_number,
+      dateOfBirth: formattedDate,
+      gender: patient.gender || '',
+      district: patient.district || '',
+      preferredLanguage: patient.preferred_language || 'en',
+    });
+    setShowModal(true);
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
-      await axios.post('/api/patients', formData);
+      if (selectedPatient) {
+        await axios.put(`/api/patients/${selectedPatient.id}`, formData);
+        alert('Patient updated successfully');
+      } else {
+        await axios.post('/api/patients', formData);
+        alert('Patient created successfully');
+      }
       setShowModal(false);
       fetchPatients();
     } catch (error) {
@@ -70,7 +101,7 @@ function Patients() {
         <div className="d-flex gap-2">
           <InputGroup style={{ width: '300px' }}>
             <Form.Control
-              placeholder="Search patients..."
+              placeholder="Search by National ID, Name, or Phone..."
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
             />
@@ -89,6 +120,7 @@ function Patients() {
             <th>Gender</th>
             <th>District</th>
             <th>Language</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -101,6 +133,15 @@ function Patients() {
               <td>{patient.gender || 'N/A'}</td>
               <td>{patient.district || 'N/A'}</td>
               <td>{patient.preferred_language}</td>
+              <td>
+                <Button
+                  size="sm"
+                  variant="warning"
+                  onClick={() => handleEdit(patient)}
+                >
+                  Edit
+                </Button>
+              </td>
             </tr>
           ))}
         </tbody>
@@ -108,7 +149,7 @@ function Patients() {
 
       <Modal show={showModal} onHide={() => setShowModal(false)}>
         <Modal.Header closeButton>
-          <Modal.Title>Add Patient</Modal.Title>
+          <Modal.Title>{selectedPatient ? 'Edit Patient' : 'Add Patient'}</Modal.Title>
         </Modal.Header>
         <Form onSubmit={handleSubmit}>
           <Modal.Body>

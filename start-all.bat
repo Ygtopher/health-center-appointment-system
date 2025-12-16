@@ -27,7 +27,16 @@ timeout /t 3 /nobreak >nul
 
 echo.
 echo ========================================
-echo Starting Frontend Server (Terminal 2)
+echo Starting ngrok Tunnel (Terminal 2)
+echo ========================================
+echo Make sure ngrok is installed and authenticated before running this script.
+start "ngrok Tunnel" cmd /k "ngrok http 3000"
+
+timeout /t 3 /nobreak >nul
+
+echo.
+echo ========================================
+echo Starting Frontend Server (Terminal 3)
 echo ========================================
 start "Frontend Server" cmd /k "cd frontend && npm run dev"
 
@@ -37,7 +46,8 @@ echo Both servers are starting!
 echo ========================================
 echo.
 echo Backend: http://localhost:3000
-echo Frontend: http://localhost:3001
+echo Frontend: http://localhost:3001 (or next available port)
+echo ngrok:   https://<generated>.ngrok-free.app -> http://localhost:3000
 echo.
 echo Press any key to close this window...
 pause >nul
